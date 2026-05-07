@@ -6,8 +6,11 @@
  *
  * Measures round-trip latency of different SDMA communication patterns:
  * - Mode 1: Device-initiated ping-pong (baseline)
- * - Mode 2: Host-populated-device-triggered (wait_flag_then_put)
+ * - Mode 2: Device-triggered (XIO wait_flag_then_put)
  * - Mode 3: Reverse offload with CPU proxy (SDMA or hipMemcpy)
+ * - Mode 4: Reverse offload with CPU proxy using hipMemcpy
+ * - Mode 5: Chained SDMA (GPU signal → Host SDMA response)
+ * - Mode 6: Device-triggered (HIP stream wait + hipMemcpyAsync)
  *
  * Prerequisites:
  *   - Two AMD GPUs with XGMI / Infinity Fabric P2P
@@ -383,9 +386,26 @@ void preEnqueueWaitThenPut(sdma_ep::SdmaQueueInfo* queueInfo,
   // handle.quiet();
 }
 
+void enqueueStreamWaitThenMemcpy(int gpuId, hipStream_t stream,
+                                 uint32_t* triggerFlag, void* src, void* dst,
+                                 size_t size, uint64_t* responseSignal,
+                                 int iterations) {
+  int prevDevice = -1;
+  HIP_CHECK(hipGetDevice(&prevDevice));
+  HIP_CHECK(hipSetDevice(gpuId));
+  for (int i = 0; i < iterations; i++) {
+    HIP_CHECK(hipStreamWaitValue32(stream, triggerFlag, static_cast<uint32_t>(i + 1), 0));
+    HIP_CHECK(hipMemcpyAsync(dst, src, size, hipMemcpyDeviceToDevice, stream));
+    HIP_CHECK(hipStreamWriteValue64(stream, responseSignal, static_cast<uint64_t>(i + 1), 0));
+  }
+  if (prevDevice >= 0 && prevDevice != gpuId) {
+    HIP_CHECK(hipSetDevice(prevDevice));
+  }
+}
+
 int runHostTriggered(const BenchmarkArgs& args, std::vector<LatencyStats>& allStats) {
   if (args.myRank == 0) {
-    printf("\n=== Mode 2: Host-Populated-Device-Triggered ===\n\n");
+    printf("\n=== Mode 2: Device-Triggered (XIO) ===\n\n");
   }
 
   // Enable bidirectional peer access
@@ -444,7 +464,7 @@ int runHostTriggered(const BenchmarkArgs& args, std::vector<LatencyStats>& allSt
                           args.iterations * sizeof(unsigned long long),
                           hipMemcpyDeviceToHost));
 
-      reportLatency("Device-Triggered", transferSize, hostLatencies,
+      reportLatency("Device-Triggered (XIO)", transferSize, hostLatencies,
                     args.iterations, cycleTimeNs, allStats);
 
       delete[] hostLatencies;
@@ -454,6 +474,69 @@ int runHostTriggered(const BenchmarkArgs& args, std::vector<LatencyStats>& allSt
   }
 
   sdma_ep::destroyQueue(&queueInfo);
+
+  return 0;
+}
+
+int runStreamWaitMemcpy(const BenchmarkArgs& args, std::vector<LatencyStats>& allStats) {
+  if (args.myRank == 0) {
+    printf("\n=== Mode 6: Device-Triggered (HIP) ===\n\n");
+  }
+
+  xio::enablePeerAccess(args.myGpu, args.peerGpu);
+
+  HIP_CHECK(hipSetDevice(args.myGpu));
+  hipStream_t waitStream;
+  HIP_CHECK(hipStreamCreateWithFlags(&waitStream, hipStreamNonBlocking));
+
+  double cycleTimeNs = getGpuCycleTimeNs(args.myGpu);
+
+  for (size_t transferSize : args.transferSizes) {
+    PingPongBuffers buffers = {};
+    setupPingPongBuffers(args, transferSize, buffers);
+
+    HIP_CHECK(hipExtMallocWithFlags(reinterpret_cast<void**>(&buffers.myTriggerFlag),
+                                    sizeof(uint32_t), hipDeviceMallocUncached));
+    HIP_CHECK(hipMemset(buffers.myTriggerFlag, 0, sizeof(uint32_t)));
+
+    enqueueStreamWaitThenMemcpy(args.myGpu, waitStream, buffers.myTriggerFlag,
+                                buffers.mySrcBuf, buffers.peerDstBuf, transferSize,
+                                buffers.peerSignal, buffers.totalIters);
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (args.myRank == 0) {
+      hipLaunchKernelGGL(deviceTriggerPingKernel, dim3(1), dim3(1), 0, nullptr,
+                         buffers.myTriggerFlag, buffers.mySignal, buffers.latencies,
+                         buffers.totalIters);
+    } else {
+      hipLaunchKernelGGL(deviceTriggerPongKernel, dim3(1), dim3(1), 0, nullptr,
+                         buffers.myTriggerFlag, buffers.mySignal, buffers.totalIters);
+    }
+
+    HIP_CHECK(hipDeviceSynchronize());
+    HIP_CHECK(hipStreamSynchronize(waitStream));
+
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    if (args.myRank == 0) {
+      unsigned long long* hostLatencies =
+          new unsigned long long[args.iterations];
+      HIP_CHECK(hipMemcpy(hostLatencies, buffers.latencies + args.warmup,
+                          args.iterations * sizeof(unsigned long long),
+                          hipMemcpyDeviceToHost));
+
+      reportLatency("Device-Triggered (HIP)", transferSize, hostLatencies,
+                    args.iterations, cycleTimeNs, allStats);
+
+      delete[] hostLatencies;
+    }
+
+    HIP_CHECK(hipStreamSynchronize(waitStream));
+    cleanupPingPongBuffers(buffers);
+  }
+
+  HIP_CHECK(hipStreamDestroy(waitStream));
 
   return 0;
 }
@@ -689,8 +772,6 @@ void cpuProxyHipMemcpy(int localGpuId, int peerGpuId, uint64_t* requestQueue,
 
   }
 
-  // printf("CPU proxy completed\n");
-
   if (prevDevice >= 0 && prevDevice != localGpuId) {
     HIP_CHECK(hipSetDevice(prevDevice));
   }
@@ -877,10 +958,11 @@ void printUsage(const char* progName) {
   printf("Options:\n");
   printf("  --mode <1|2|3|4|5>   Benchmark mode (default: 1)\n");
   printf("                       1 = Device-initiated ping-pong\n");
-  printf("                       2 = Host-populated-device-triggered\n");
+  printf("                       2 = Device-triggered (XIO wait_flag_then_put)\n");
   printf("                       3 = Reverse offload (CPU + SDMA)\n");
   printf("                       4 = Reverse offload (CPU + hipMemcpy)\n");
   printf("                       5 = Chained SDMA (GPU signal → Host SDMA)\n");
+  printf("                       6 = Device-triggered (HIP stream wait + hipMemcpyAsync)\n");
   printf("  --iterations <N>     Number of iterations (default: 1000)\n");
   printf("  --warmup <N>         Number of warmup iterations (default: 10)\n");
   printf("  --output-format <format>  Output format: text, json, csv (default: text)\n");
@@ -1036,6 +1118,9 @@ int main(int argc, char** argv) {
     break;
   case 5:
     rc = runChained(args, allStats);
+    break;
+  case 6:
+    rc = runStreamWaitMemcpy(args, allStats);
     break;
   default:
     fprintf(stderr, "ERROR: Invalid mode %d\n", args.mode);
