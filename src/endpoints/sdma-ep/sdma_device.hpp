@@ -95,6 +95,21 @@ CreateAtomicIncPacket(uint64_t* addr) {
 }
 
 /**
+ * @brief Build an SDMA atomic increment packet (32-bit).
+ *
+ * Atomically adds 1 to the 32-bit value at the given
+ * address via the SDMA engine (not the shader ALU).
+ *
+ * @param addr Address of the 32-bit value to increment.
+ * @return Populated SDMA_PKT_ATOMIC.
+ */
+__device__ __forceinline__ SDMA_PKT_ATOMIC
+CreateAtomicIncPacket(uint32_t* addr) {
+  anvil::packets::AtomicAddPacket<uint32_t> pkt(addr, 1);
+  return pkt.value;
+}
+
+/**
  * @brief Build an SDMA fence packet.
  *
  * Writes a data value to a memory address after all
@@ -506,11 +521,39 @@ __device__ __forceinline__ void signal(SdmaQueueHandle& handle,
                                               signal, nullptr);
 }
 
+__device__ __forceinline__ void signal(SdmaQueueHandle& handle,
+                                       uint32_t* signal) {
+  uint64_t offset = 0;
+  auto base = handle.ReserveQueueSpace(sizeof(SDMA_PKT_ATOMIC), offset);
+  uint64_t pendingWptr = base;
+  auto pkt = CreateAtomicIncPacket(signal);
+  handle.placePacket(pkt, pendingWptr, offset);
+  handle.submitPacket(base, pendingWptr);
+}
+
 __device__ __forceinline__ void putSignal(SdmaQueueHandle& handle, void* dst,
                                           void* src, size_t size,
                                           uint64_t* signal) {
   put_signal_counter_impl<true, true, false>(handle, dst, src, size, signal,
                                              nullptr);
+}
+
+__device__ __forceinline__ void putSignal(SdmaQueueHandle& handle, void* dst,
+                                          void* src, size_t size,
+                                          uint32_t* signal) {
+  constexpr size_t space_required = sizeof(SDMA_PKT_COPY_LINEAR) + sizeof(SDMA_PKT_ATOMIC);
+  uint64_t offset = 0;
+  auto base = handle.ReserveQueueSpace(space_required, offset);
+  uint64_t pendingWptr = base;
+
+  auto copyPkt = CreateCopyPacket(src, dst, size);
+  handle.placePacket(copyPkt, pendingWptr, offset);
+  offset = 0;
+
+  auto sigPkt = CreateAtomicIncPacket(signal);
+  handle.placePacket(sigPkt, pendingWptr, offset);
+
+  handle.submitPacket(base, pendingWptr);
 }
 
 __device__ __forceinline__ void putSignalCounter(SdmaQueueHandle& handle,
@@ -519,6 +562,29 @@ __device__ __forceinline__ void putSignalCounter(SdmaQueueHandle& handle,
                                                  uint64_t* counter) {
   put_signal_counter_impl<true, true, true>(handle, dst, src, size, signal,
                                             counter);
+}
+
+__device__ __forceinline__ void putSignalCounter(SdmaQueueHandle& handle,
+                                                 void* dst, void* src,
+                                                 size_t size, uint32_t* signal,
+                                                 uint32_t* counter) {
+  constexpr size_t space_required = sizeof(SDMA_PKT_COPY_LINEAR) + 2 * sizeof(SDMA_PKT_ATOMIC);
+  uint64_t offset = 0;
+  auto base = handle.ReserveQueueSpace(space_required, offset);
+  uint64_t pendingWptr = base;
+
+  auto copyPkt = CreateCopyPacket(src, dst, size);
+  handle.placePacket(copyPkt, pendingWptr, offset);
+  offset = 0;
+
+  auto sigPkt = CreateAtomicIncPacket(signal);
+  handle.placePacket(sigPkt, pendingWptr, offset);
+  offset = 0;
+
+  auto ctrPkt = CreateAtomicIncPacket(counter);
+  handle.placePacket(ctrPkt, pendingWptr, offset);
+
+  handle.submitPacket(base, pendingWptr);
 }
 
 __device__ __forceinline__ void putCounter(SdmaQueueHandle& handle, void* dst,
