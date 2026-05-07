@@ -23,6 +23,7 @@
 #include <cstring>
 #include <climits>
 #include <thread>
+#include <memory>
 #include <vector>
 #include <algorithm>
 #include <getopt.h>
@@ -174,13 +175,22 @@ int setupPingPongBuffers(const BenchmarkArgs& args, size_t transferSize,
                MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
   // Open peer's memory
+  int prevDevice = -1;
+  if (args.mode == 4) {
+    HIP_CHECK(hipGetDevice(&prevDevice));
+    HIP_CHECK(hipSetDevice(args.peerGpu));
+  }
   HIP_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&buffers.peerSrcBuf), peerSrcHandle,
                                 hipIpcMemLazyEnablePeerAccess));
   HIP_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&buffers.peerDstBuf), peerDstHandle,
                                 hipIpcMemLazyEnablePeerAccess));
   HIP_CHECK(hipIpcOpenMemHandle(reinterpret_cast<void**>(&buffers.peerSignal), peerSignalHandle,
                                 hipIpcMemLazyEnablePeerAccess));
-
+  if (args.mode == 4) {
+    if (prevDevice >= 0 && prevDevice != args.peerGpu) {
+      HIP_CHECK(hipSetDevice(prevDevice));
+    }
+  } 
   // Allocate latencies (only rank 0 measures)
   if (args.myRank == 0) {
     HIP_CHECK(hipMalloc(&buffers.latencies, buffers.totalIters * sizeof(unsigned long long)));
@@ -651,42 +661,39 @@ void cpuProxySdma(sdma_ep::SdmaQueueInfo* queueInfo, uint64_t* requestQueue,
   handle.quiet();
 }
 
-void cpuProxyHipMemcpy(int gpuId, uint64_t* requestQueue,
+void cpuProxyHipMemcpy(int localGpuId, int peerGpuId, uint64_t* requestQueue,
                        void* src, void* dst, size_t size,
-                       uint64_t* localSignal,
                        uint64_t* responseSignal, int iterations,
-                       hipStream_t* stream) {
-  // Set device context for this thread
-  HIP_CHECK(hipSetDevice(gpuId));
+                       hipStream_t* peerStream, uint64_t* hostSignal) {
+  int prevDevice = -1;
+  HIP_CHECK(hipGetDevice(&prevDevice));
+  HIP_CHECK(hipSetDevice(localGpuId));
 
-  // Make local volatile pointer for polling
   volatile uint64_t* volatileQueue = requestQueue;
 
-  // Allocate pinned host buffer for signal value (persistent for async copies)
-  printf("CPU proxy (hipMemcpy) started, gpuId=%d\n", gpuId);
-
   for (int i = 0; i < iterations; i++) {
-    // Busy-wait poll for lowest latency
     while (volatileQueue[0] < static_cast<uint64_t>(i + 1)) {
       /* tight spin */
     }
 
-    if (i == 0) printf("CPU proxy iter 0: triggered, dst=%p responseSignal=%p\n", dst, responseSignal);
-
     // For ping-pong we only need to signal, not copy data
     // (copying to IPC-opened memory via hipMemcpy might not work)
-    // HIP_CHECK(hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice, *peerStream));
 
-    // Signal completion (write i+1 to device signal)
-    *localSignal = i + 1;
-    HIP_CHECK(hipMemcpyAsync(responseSignal, localSignal, sizeof(uint64_t),
-                             hipMemcpyHostToDevice, *stream));
-    if (i == 0) printf("CPU proxy iter 0: signaled, local=%p responseSignal=%p\n", localSignal, responseSignal);
+    *hostSignal = static_cast<uint64_t>(i + 1);
+    HIP_CHECK(hipSetDevice(peerGpuId));
+    HIP_CHECK(hipMemcpyAsync(responseSignal, hostSignal, sizeof(uint64_t),
+                             hipMemcpyHostToDevice, *peerStream));
+    HIP_CHECK(hipStreamSynchronize(*peerStream));
+    HIP_CHECK(hipSetDevice(localGpuId));
 
   }
 
-  printf("CPU proxy completed\n");
-  HIP_CHECK(hipStreamSynchronize(*stream));
+  // printf("CPU proxy completed\n");
+
+  if (prevDevice >= 0 && prevDevice != localGpuId) {
+    HIP_CHECK(hipSetDevice(prevDevice));
+  }
 }
 
 int runReverseOffload(const BenchmarkArgs& args, bool useHipMemcpy, std::vector<LatencyStats>& allStats) {
@@ -715,14 +722,18 @@ int runReverseOffload(const BenchmarkArgs& args, bool useHipMemcpy, std::vector<
 
   double cycleTimeNs = getGpuCycleTimeNs(args.myGpu);
 
-  // Create comm stream for hipMemcpyAsync in this thread
+  // Create comm stream for hipMemcpyAsync in this thread (peer GPU owns the signal)
   hipStream_t com_stream;
+  int prevDevice = -1;
+  HIP_CHECK(hipGetDevice(&prevDevice));
+  HIP_CHECK(hipSetDevice(args.peerGpu));
   HIP_CHECK(hipStreamCreate(&com_stream));
+  if (prevDevice >= 0 && prevDevice != args.peerGpu) {
+    HIP_CHECK(hipSetDevice(prevDevice));
+  }
 
-  uint64_t* signalValueHost = nullptr;
-  HIP_CHECK(hipHostMalloc(&signalValueHost, sizeof(uint64_t), hipHostMallocDefault));
-
-
+  auto hostSignalValue = std::make_unique<uint64_t>(0);
+  HIP_CHECK(hipSetDevice(args.myGpu));
 
   for (size_t transferSize : args.transferSizes) {
     // Use common buffer setup
@@ -744,9 +755,9 @@ int runReverseOffload(const BenchmarkArgs& args, bool useHipMemcpy, std::vector<
     // Launch CPU proxy thread (monitors LOCAL myRequestQueue, writes to PEER signal)
     std::thread proxy;
     if (useHipMemcpy) {
-      proxy = std::thread(cpuProxyHipMemcpy, args.myGpu, buffers.myRequestQueue,
+      proxy = std::thread(cpuProxyHipMemcpy, args.myGpu, args.peerGpu, buffers.myRequestQueue,
                           buffers.mySrcBuf, buffers.peerDstBuf, transferSize,
-                          signalValueHost, buffers.peerSignal, buffers.totalIters, &com_stream);
+                          buffers.peerSignal, buffers.totalIters, &com_stream, hostSignalValue.get());
     } else {
       proxy = std::thread(cpuProxySdma, &queueInfo, buffers.myRequestQueue,
                           buffers.mySrcBuf, buffers.peerDstBuf, transferSize,
@@ -792,8 +803,10 @@ int runReverseOffload(const BenchmarkArgs& args, bool useHipMemcpy, std::vector<
     cleanupPingPongBuffers(buffers);
   }
 
-  HIP_CHECK(hipHostFree(signalValueHost));
+  HIP_CHECK(hipSetDevice(args.peerGpu));
+  hostSignalValue.reset();
   HIP_CHECK(hipStreamDestroy(com_stream));
+  HIP_CHECK(hipSetDevice(args.myGpu));
 
   return 0;
 }
