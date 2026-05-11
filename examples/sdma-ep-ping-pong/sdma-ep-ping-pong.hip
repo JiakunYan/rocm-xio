@@ -366,9 +366,11 @@ __global__ void deviceTriggerPongKernel(volatile uint32_t* triggerFlag,
   }
 }
 
+template <typename SignalT>
 void preEnqueueWaitThenPut(sdma_ep::SdmaQueueInfo* queueInfo,
                             uint32_t* triggerFlag, void* src, void* dst,
-                            size_t size, uint64_t* responseSignal, int iterations) {
+                            size_t size, SignalT* responseSignal, int iterations,
+                            SignalT signalIncrement = SignalT{1}) {
   auto handle = sdma_ep::getHostHandle(queueInfo->srcDeviceId, queueInfo->dstDeviceId, 0);
 
   // Pre-enqueue all wait_then_put + signal operations
@@ -379,11 +381,8 @@ void preEnqueueWaitThenPut(sdma_ep::SdmaQueueInfo* queueInfo,
                               dst, size);
 
     // Signal GPU that response is ready (atomic ADD by 1)
-    handle.signal(responseSignal, static_cast<uint64_t>(1));
+    handle.signal(responseSignal, signalIncrement);
   }
-
-  // Submit all operations to SDMA queue
-  // handle.quiet();
 }
 
 void enqueueStreamWaitThenMemcpy(int gpuId, hipStream_t stream,
@@ -395,7 +394,7 @@ void enqueueStreamWaitThenMemcpy(int gpuId, hipStream_t stream,
   HIP_CHECK(hipSetDevice(gpuId));
   for (int i = 0; i < iterations; i++) {
     HIP_CHECK(hipStreamWaitValue32(stream, triggerFlag, static_cast<uint32_t>(i + 1), 0));
-    HIP_CHECK(hipMemcpyAsync(dst, src, size, hipMemcpyDeviceToDevice, stream));
+    HIP_CHECK(hipMemcpyAsync(dst, src, size, hipMemcpyDeviceToDeviceNoCU , stream));
     HIP_CHECK(hipStreamWriteValue64(stream, responseSignal, static_cast<uint64_t>(i + 1), 0));
   }
   if (prevDevice >= 0 && prevDevice != gpuId) {
@@ -545,44 +544,6 @@ int runStreamWaitMemcpy(const BenchmarkArgs& args, std::vector<LatencyStats>& al
 // Mode 5: Chained SDMA (GPU signal → Host SDMA response, no pong kernel)
 // ============================================================================
 
-// Rank 0 (ping): GPU signals pong-side host, waits for response
-__global__ void chainedPingKernel(sdma_ep::SdmaQueueHandle* myQueue,
-                                  uint32_t* peerTriggerFlag,
-                                  uint64_t* mySignal,
-                                  unsigned long long* latencies,
-                                  int iterations) {
-  sdma_ep::SdmaQueueHandle myQueueReg = *myQueue;
-
-  for (int i = 0; i < iterations; i++) {
-    unsigned long long t0 = wall_clock64();
-
-    // Signal pong-side host to trigger SDMA response (32-bit signal)
-    sdma_ep::signal(myQueueReg, peerTriggerFlag);
-
-    // Wait for pong-side host SDMA response
-    sdma_ep::waitSignal(mySignal, static_cast<uint64_t>(i + 1));
-
-    latencies[i] = wall_clock64() - t0;
-  }
-}
-
-// Rank 1 (pong): No kernel - just host thread waiting and responding
-void chainedPongHost(sdma_ep::SdmaQueueInfo* queueInfo,
-                     uint32_t* myTriggerFlag,
-                     void* src, void* dst, size_t size,
-                     uint64_t* responseSignal,
-                     int iterations) {
-  auto handle = sdma_ep::getHostHandle(queueInfo->srcDeviceId, queueInfo->dstDeviceId, 0);
-
-  // Pre-enqueue all wait_then_put + signal operations
-  for (int i = 0; i < iterations; i++) {
-    // Wait for ping GPU signal, then immediately respond with SDMA
-    handle.wait_flag_then_put(myTriggerFlag, static_cast<uint32_t>(i + 1),
-                              src, dst, size);
-    handle.signal(responseSignal, static_cast<uint64_t>(1));
-  }
-}
-
 int runChained(const BenchmarkArgs& args, std::vector<LatencyStats>& allStats) {
   if (args.myRank == 0) {
     printf("\n=== Mode 5: Chained SDMA (GPU → Host SDMA) ===\n\n");
@@ -597,16 +558,6 @@ int runChained(const BenchmarkArgs& args, std::vector<LatencyStats>& allStats) {
     fprintf(stderr, "Rank %d: ERROR: createHostQueue failed (%d)\n",
             args.myRank, rc);
     return 1;
-  }
-
-  // Only rank 0 needs device-initiated queue for signaling
-  sdma_ep::SdmaQueueInfo myQueue = {};
-  if (args.myRank == 0) {
-    rc = sdma_ep::createQueue(args.myGpu, args.peerGpu, &myQueue);
-    if (rc != 0) {
-      fprintf(stderr, "Rank 0: ERROR: createQueue failed (%d)\n", rc);
-      return 1;
-    }
   }
 
   double cycleTimeNs = getGpuCycleTimeNs(args.myGpu);
@@ -635,20 +586,24 @@ int runChained(const BenchmarkArgs& args, std::vector<LatencyStats>& allStats) {
 
     HIP_CHECK(hipSetDevice(args.myGpu));
 
-    // Rank 1: Pre-enqueue all wait_then_put operations before barrier
-    if (args.myRank == 1) {
-      chainedPongHost(&queueInfo, buffers.myTriggerFlag,
-                      buffers.mySrcBuf, buffers.peerDstBuf, transferSize,
-                      buffers.peerSignal, buffers.totalIters);
+    // Pre-enqueue all wait_then_put operations before barrier
+    if (args.myRank == 0) {
+      preEnqueueWaitThenPut(&queueInfo, buffers.myTriggerFlag,
+                            buffers.mySrcBuf, buffers.peerDstBuf, transferSize,
+                            peerTriggerFlag, buffers.totalIters, uint32_t{1});
+    } else {
+      preEnqueueWaitThenPut(&queueInfo, buffers.myTriggerFlag,
+                            buffers.mySrcBuf, buffers.peerDstBuf, transferSize,
+                            buffers.peerSignal, buffers.totalIters, uint64_t{1});
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
 
     // Rank 0: Launch ping kernel after rank 1 has pre-enqueued
     if (args.myRank == 0) {
-      hipLaunchKernelGGL(chainedPingKernel, dim3(1), dim3(1), 0, nullptr,
-                         static_cast<sdma_ep::SdmaQueueHandle*>(myQueue.deviceHandle),
-                         peerTriggerFlag, buffers.mySignal, buffers.latencies,
+      hipLaunchKernelGGL(deviceTriggerPingKernel, dim3(1), dim3(1), 0, nullptr,
+                         reinterpret_cast<volatile uint32_t*>(buffers.myTriggerFlag),
+                         buffers.mySignal, buffers.latencies,
                          buffers.totalIters);
     }
 
@@ -677,9 +632,6 @@ int runChained(const BenchmarkArgs& args, std::vector<LatencyStats>& allStats) {
     cleanupPingPongBuffers(buffers);
   }
 
-  if (args.myRank == 0) {
-    sdma_ep::destroyQueue(&myQueue);
-  }
   sdma_ep::destroyQueue(&queueInfo);
 
   return 0;
@@ -761,7 +713,7 @@ void cpuProxyHipMemcpy(int localGpuId, int peerGpuId, uint64_t* requestQueue,
 
     // For ping-pong we only need to signal, not copy data
     // (copying to IPC-opened memory via hipMemcpy might not work)
-    HIP_CHECK(hipMemcpyAsync(dst, src, size, hipMemcpyHostToDevice, *peerStream));
+    HIP_CHECK(hipMemcpyAsync(dst, src, size, hipMemcpyDeviceToDeviceNoCU, *peerStream));
 
     *hostSignal = static_cast<uint64_t>(i + 1);
     HIP_CHECK(hipSetDevice(peerGpuId));
