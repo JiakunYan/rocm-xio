@@ -422,6 +422,23 @@ void SdmaQueueHostHandle::quiet()
    std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
+bool SdmaQueueHostHandle::test_quiet()
+{
+   // Get the committed write pointer (what's been submitted to hardware)
+   uint64_t target_wptr = queue->hostCommittedWptr_.load(std::memory_order_acquire);
+
+   // Single non-blocking check of whether hardware caught up to the target.
+   if (*queue->queue_.Queue_read_ptr_aql != target_wptr)
+   {
+      std::atomic_thread_fence(std::memory_order_acquire);
+      return false;
+   }
+
+   // Ensure all memory operations from SDMA are visible
+   std::atomic_thread_fence(std::memory_order_seq_cst);
+   return true;
+}
+
 void SdmaQueueHostHandle::submit(const std::vector<SdmaPacket>& packets)
 {
    if (packets.empty())

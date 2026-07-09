@@ -87,6 +87,9 @@ class SdmaQueueHostHandle
 
    // Wait for all submitted SDMA operations to complete
    void quiet();
+
+   // Non-blocking test for whether all submitted SDMA operations completed
+   bool test_quiet();
    // Write GPU timestamp to memory location
    void timestamp(uint64_t* timestamp_ptr);
 
