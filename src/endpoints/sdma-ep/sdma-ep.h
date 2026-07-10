@@ -188,6 +188,23 @@ int createQueue(int srcDeviceId, int dstDeviceId, SdmaQueueInfo* info);
 int createHostQueue(int srcDeviceId, int dstDeviceId, SdmaQueueInfo* info);
 
 /**
+ * @brief Create a host-initiated SDMA queue on an explicit engine.
+ *
+ * @param srcDeviceId Source HIP device ID.
+ * @param dstDeviceId Destination HIP device ID used for queue lookup metadata.
+ * @param engineId    KFD SDMA engine ID.
+ * @param info        Output queue information (deviceHandle will be nullptr).
+ * @return 0 on success, negative error code on failure.
+ */
+int createHostQueueOnEngine(int srcDeviceId, int dstDeviceId, int engineId,
+                            SdmaQueueInfo* info);
+
+/**
+ * @brief Return XIO's recommended SDMA engine for a GPU pair.
+ */
+int getSdmaEngineId(int srcDeviceId, int dstDeviceId);
+
+/**
  * @brief Initialize a device-initiated SDMA queue (idempotent).
  *
  * Idempotent version of createQueue(). If a queue already exists for the

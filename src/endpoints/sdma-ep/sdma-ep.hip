@@ -71,21 +71,33 @@ int createQueue(int srcDeviceId, int dstDeviceId, SdmaQueueInfo* info) {
 }
 
 int createHostQueue(int srcDeviceId, int dstDeviceId, SdmaQueueInfo* info) {
+  int engineId;
+  try {
+    engineId = ::anvil::AnvilLib::getInstance().getSdmaEngineId(srcDeviceId,
+                                                                dstDeviceId);
+  } catch (const std::exception& e) {
+    std::cerr << "sdma_ep::createHostQueue: " << e.what() << std::endl;
+    return -1;
+  }
+  return createHostQueueOnEngine(srcDeviceId, dstDeviceId, engineId, info);
+}
+
+int createHostQueueOnEngine(int srcDeviceId, int dstDeviceId, int engineId,
+                            SdmaQueueInfo* info) {
   if (!s_initialized) {
-    std::cerr << "sdma_ep::createHostQueue: " << "call initEndpoint() first"
-              << std::endl;
+    std::cerr << "sdma_ep::createHostQueueOnEngine: "
+              << "call initEndpoint() first" << std::endl;
     return -1;
   }
   try {
-    uint32_t engineId = ::anvil::AnvilLib::getInstance().getSdmaEngineId(
-      srcDeviceId, dstDeviceId);
     int channelIdx = 0;
     ::anvil::SdmaQueue* q = ::anvil::AnvilLib::getInstance().createSdmaQueue(
-      srcDeviceId, dstDeviceId, engineId, &channelIdx, true);
+      srcDeviceId, dstDeviceId, static_cast<uint32_t>(engineId), &channelIdx,
+      true);
 
     if (!q) {
-      std::cerr << "sdma_ep::createHostQueue: " << "queue creation failed"
-                << std::endl;
+      std::cerr << "sdma_ep::createHostQueueOnEngine: "
+                << "queue creation failed" << std::endl;
       return -1;
     }
     if (info) {
@@ -97,9 +109,14 @@ int createHostQueue(int srcDeviceId, int dstDeviceId, SdmaQueueInfo* info) {
     }
     return 0;
   } catch (const std::exception& e) {
-    std::cerr << "sdma_ep::createHostQueue: " << e.what() << std::endl;
+    std::cerr << "sdma_ep::createHostQueueOnEngine: " << e.what() << std::endl;
     return -1;
   }
+}
+
+int getSdmaEngineId(int srcDeviceId, int dstDeviceId) {
+  return ::anvil::AnvilLib::getInstance().getSdmaEngineId(srcDeviceId,
+                                                           dstDeviceId);
 }
 
 void destroyQueue(SdmaQueueInfo* info) {
