@@ -282,6 +282,15 @@ void register_sdma_ep(nb::module_& m) {
     "src_device"_a, "dst_device"_a, "channel_idx"_a,
     "Wait for all SDMA operations to complete");
 
+  m.def(
+    "test_quiet",
+    [](int srcDevice, int dstDevice, int channelIdx) {
+      auto handle = sdma_ep::getHostHandle(srcDevice, dstDevice, channelIdx);
+      return handle.test_quiet();
+    },
+    "src_device"_a, "dst_device"_a, "channel_idx"_a,
+    "Non-blocking test for whether all SDMA operations completed");
+
   // SdmaQueuePythonDeviceCtx struct
   nb::class_<sdma_ep::SdmaQueuePythonDeviceCtx>(m, "SdmaQueuePythonDeviceCtx")
     .def(nb::init<>())
