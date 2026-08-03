@@ -249,9 +249,10 @@ SdmaQueuePythonDeviceCtx getPythonDeviceContext(int srcDeviceId,
 /**
  * @brief Get a host handle for SDMA operations.
  *
- * Returns a handle that can be used to perform host-initiated
- * SDMA operations (put, signal, etc.). The handle is lightweight
- * and can be copied freely.
+ * Returns a move-only handle for host-initiated SDMA operations (put,
+ * signal, etc.). Each queue has a single producer: the returned handle must
+ * be exclusively owned and used by one host thread. Do not retrieve or use
+ * multiple handles for the same queue concurrently.
  *
  * @param srcDeviceId Source HIP device ID.
  * @param dstDeviceId Destination HIP device ID.
