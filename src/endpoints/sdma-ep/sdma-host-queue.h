@@ -25,14 +25,31 @@ using SdmaPacket = std::variant<::anvil::packets::CopyLinearPacket,
                                 ::anvil::packets::AtomicAddPacket<uint64_t>,
                                 ::anvil::packets::PollRegmemPacket<uint32_t>>;
 
-// Host-side handle for CPU-initiated SDMA operations
+// Host-side handle for CPU-initiated SDMA operations.
+//
+// Single-producer contract: one handle must be exclusively owned and used by
+// one host thread. Concurrent calls, or multiple handles for the same queue,
+// are unsupported. The handle is move-only so a deferred packet sequence
+// cannot be duplicated.
 class SdmaQueueHostHandle {
 public:
   explicit SdmaQueueHostHandle(::anvil::SdmaQueue* q) : queue(q) {
   }
+  SdmaQueueHostHandle(const SdmaQueueHostHandle&) = delete;
+  SdmaQueueHostHandle& operator=(const SdmaQueueHostHandle&) = delete;
+  SdmaQueueHostHandle(SdmaQueueHostHandle&& other) noexcept;
+  SdmaQueueHostHandle& operator=(SdmaQueueHostHandle&&) = delete;
 
   // Host-initiated SDMA operations
   void put(void* dst, void* src, size_t size);
+
+  // Enqueue a linear copy without ringing the doorbell. A positive threshold
+  // flushes after that many deferred copies; zero leaves flushing to flush(),
+  // signal(), quiet(), or another submission.
+  void put_deferred(void* dst, void* src, size_t size, size_t flush_threshold);
+
+  // Submit all deferred packets in one doorbell ring.
+  void flush();
 
   template <typename T>
   void signal(T* ptr, T value);
@@ -100,8 +117,13 @@ private:
   bool canWriteUpto(uint64_t uptoIndex);
   uint64_t wrapIntoRing(uint64_t index) const;
   void padRingToEnd(uint64_t cur_index);
+  void appendDeferredPacket(const void* packet, size_t packet_size);
 
   ::anvil::SdmaQueue* queue;
+  bool hasDeferredPackets_ = false;
+  uint64_t deferredBase_ = 0;
+  uint64_t deferredWptr_ = 0;
+  size_t deferredCopyCount_ = 0;
 };
 
 } // namespace sdma_ep

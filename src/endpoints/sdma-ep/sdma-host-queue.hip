@@ -1,3 +1,4 @@
+#include <cassert>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -117,31 +118,40 @@ uint64_t SdmaQueueHostHandle::wrapIntoRing(uint64_t index) const {
   return index % sdma_ep::SDMA_QUEUE_SIZE;
 }
 
+SdmaQueueHostHandle::SdmaQueueHostHandle(SdmaQueueHostHandle&& other) noexcept
+  : queue(other.queue), hasDeferredPackets_(other.hasDeferredPackets_),
+    deferredBase_(other.deferredBase_), deferredWptr_(other.deferredWptr_),
+    deferredCopyCount_(other.deferredCopyCount_) {
+  other.queue = nullptr;
+  other.hasDeferredPackets_ = false;
+  other.deferredBase_ = 0;
+  other.deferredWptr_ = 0;
+  other.deferredCopyCount_ = 0;
+}
+
 void SdmaQueueHostHandle::padRingToEnd(uint64_t cur_index) {
   const uint32_t queue_size_in_bytes = sdma_ep::SDMA_QUEUE_SIZE;
   uint64_t padding_size = queue_size_in_bytes - wrapIntoRing(cur_index);
   uint64_t new_index = cur_index + padding_size;
 
-  if (!canWriteUpto(new_index)) {
-    return;
+  // Deferred packets must be committed before padding can ring the doorbell.
+  assert(!hasDeferredPackets_);
+  while (!canWriteUpto(new_index)) {
+    std::this_thread::yield();
   }
 
-  // Atomic compare-and-swap to claim space for padding
-  if (queue->hostCachedWptr_.compare_exchange_weak(cur_index, new_index,
-                                                   std::memory_order_release,
-                                                   std::memory_order_relaxed)) {
-    uint64_t num_nops = padding_size / sizeof(uint32_t);
-    uint32_t* queueBuf = static_cast<uint32_t*>(queue->queueBuffer_);
-    uint64_t offset_dwords = wrapIntoRing(cur_index) / sizeof(uint32_t);
+  // The single producer owns all reservations for this queue.
+  uint64_t num_nops = padding_size / sizeof(uint32_t);
+  uint32_t* queueBuf = static_cast<uint32_t*>(queue->queueBuffer_);
+  uint64_t offset_dwords = wrapIntoRing(cur_index) / sizeof(uint32_t);
 
-    // Fill with NOP packets
-    for (uint64_t i = 0; i < num_nops; i++) {
-      queueBuf[offset_dwords + i] = SDMA_OP_NOP;
-    }
-
-    // Submit NOP packets
-    submitPacket(cur_index, new_index);
+  // Fill with NOP packets.
+  for (uint64_t i = 0; i < num_nops; i++) {
+    queueBuf[offset_dwords + i] = SDMA_OP_NOP;
   }
+
+  queue->hostCachedWptr_.store(new_index, std::memory_order_relaxed);
+  submitPacket(cur_index, new_index);
 }
 
 bool SdmaQueueHostHandle::canWriteUpto(uint64_t uptoIndex) {
@@ -161,6 +171,7 @@ uint64_t SdmaQueueHostHandle::reserveQueueSpace(size_t size_in_bytes) {
     // Check if packet would cross ring boundary
     if (wrapIntoRing(cur_index) + size_in_bytes > queue_size_in_bytes) {
       // Pad to end and try again
+      assert(!hasDeferredPackets_);
       padRingToEnd(cur_index);
       continue;
     }
@@ -171,13 +182,9 @@ uint64_t SdmaQueueHostHandle::reserveQueueSpace(size_t size_in_bytes) {
       continue; // Queue full, spin
     }
 
-    // Atomic compare-and-swap to claim space
-    if (queue->hostCachedWptr_.compare_exchange_weak(
-          cur_index, new_index, std::memory_order_release,
-          std::memory_order_relaxed)) {
-      break;
-    }
-    std::this_thread::yield();
+    // The single producer owns all reservations for this queue.
+    queue->hostCachedWptr_.store(new_index, std::memory_order_relaxed);
+    break;
   }
 
   return cur_index;
@@ -193,10 +200,8 @@ void SdmaQueueHostHandle::placePacket(const void* packet, size_t packet_size,
 }
 
 void SdmaQueueHostHandle::submitPacket(uint64_t base, uint64_t pending_wptr) {
-  // Wait for previous packet to complete (serialization)
-  while (queue->hostCommittedWptr_.load(std::memory_order_acquire) != base) {
-    std::this_thread::yield();
-  }
+  // The single producer commits each reservation in order.
+  assert(queue->hostCommittedWptr_.load(std::memory_order_relaxed) == base);
 
   // Memory fence
   std::atomic_thread_fence(std::memory_order_release);
@@ -217,11 +222,56 @@ void SdmaQueueHostHandle::put(void* dst, void* src, size_t size) {
   submit({packets::CopyLinearPacket(src, dst, size)});
 }
 
+void SdmaQueueHostHandle::appendDeferredPacket(const void* packet,
+                                               size_t packet_size) {
+  uint64_t cached_wptr = queue->hostCachedWptr_.load(std::memory_order_relaxed);
+  if (hasDeferredPackets_ &&
+      (wrapIntoRing(cached_wptr) + packet_size > sdma_ep::SDMA_QUEUE_SIZE ||
+       !canWriteUpto(cached_wptr + packet_size))) {
+    flush();
+  }
+
+  uint64_t offset = reserveQueueSpace(packet_size);
+  if (!hasDeferredPackets_) {
+    hasDeferredPackets_ = true;
+    deferredBase_ = offset;
+  } else {
+    assert(offset == deferredWptr_);
+  }
+  placePacket(packet, packet_size, offset);
+  deferredWptr_ = offset + packet_size;
+}
+
+void SdmaQueueHostHandle::put_deferred(void* dst, void* src, size_t size,
+                                       size_t flush_threshold) {
+  validate_linear_args(src, dst, size, "put_deferred");
+  packets::CopyLinearPacket packet(src, dst, size);
+  appendDeferredPacket(packet.data(), packet.size_bytes());
+  ++deferredCopyCount_;
+
+  if (flush_threshold > 0 && deferredCopyCount_ >= flush_threshold) {
+    flush();
+  }
+}
+
+void SdmaQueueHostHandle::flush() {
+  if (!hasDeferredPackets_) {
+    return;
+  }
+  submitPacket(deferredBase_, deferredWptr_);
+  hasDeferredPackets_ = false;
+  deferredBase_ = 0;
+  deferredWptr_ = 0;
+  deferredCopyCount_ = 0;
+}
+
 template <typename T>
 void SdmaQueueHostHandle::signal(T* ptr, T value) {
   static_assert(sizeof(T) == 4 || sizeof(T) == 8,
                 "signal only supports 32-bit or 64-bit types");
-  submit({build_atomic_packet(ptr, value, "signal")});
+  auto packet = build_atomic_packet(ptr, value, "signal");
+  appendDeferredPacket(packet.data(), packet.size_bytes());
+  flush();
 }
 
 void SdmaQueueHostHandle::timestamp(uint64_t* timestamp_ptr) {
@@ -396,6 +446,7 @@ template void SdmaQueueHostHandle::wait_flag_then_put_tiles<uint32_t>(
   const std::vector<void*>& dst_ptrs, const std::vector<size_t>& dst_strides);
 
 void SdmaQueueHostHandle::quiet() {
+  flush();
   // Get the committed write pointer (what's been submitted to hardware)
   uint64_t target_wptr = queue->hostCommittedWptr_.load(
     std::memory_order_acquire);
@@ -465,6 +516,7 @@ void SdmaQueueHostHandle::submit(const std::vector<SdmaPacket>& packets) {
     return;
   }
 
+  flush();
   size_t total_size = total_packet_bytes(packets);
   check_submit_size(total_size);
 
@@ -488,6 +540,7 @@ void SdmaQueueHostHandle::submit(std::initializer_list<SdmaPacket> packets) {
     return;
   }
 
+  flush();
   size_t total_size = total_packet_bytes(packets);
   check_submit_size(total_size);
 

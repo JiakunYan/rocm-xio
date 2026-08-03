@@ -9,8 +9,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
+#include <type_traits>
 
 #include "sdma-ep.h"
+#include "sdma-host-queue.h"
 #include "sdma-tester.h"
 #include "sdma_device.hpp"
 #include "xio-test-assert.h"
@@ -115,6 +117,13 @@ int test_getIterations_returns_fixed_value() {
   return 0;
 }
 
+int test_host_handle_single_producer_contract() {
+  ASSERT_TRUE(!std::is_copy_constructible<SdmaQueueHostHandle>::value);
+  ASSERT_TRUE(!std::is_copy_assignable<SdmaQueueHostHandle>::value);
+  ASSERT_TRUE(std::is_nothrow_move_constructible<SdmaQueueHostHandle>::value);
+  return 0;
+}
+
 int main() {
   int failures = 0;
   failures += test_config_defaults();
@@ -125,6 +134,7 @@ int main() {
   failures += test_queue_info_defaults_and_fields();
   failures += test_device_side_constants_are_sane();
   failures += test_getIterations_returns_fixed_value();
+  failures += test_host_handle_single_producer_contract();
 
   if (failures == 0) {
     printf("All sdma-ep config tests passed.\n");
